@@ -1,0 +1,94 @@
+x-app-environment: &app-environment
+  PAYMENTS_ENVIRONMENT: development
+  PAYMENTS_DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+  PAYMENTS_RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+  PAYMENTS_API_KEY: ${PAYMENTS_API_KEY:?Set PAYMENTS_API_KEY in .env}
+  PAYMENTS_WEBHOOK_SIGNING_SECRET: ${PAYMENTS_WEBHOOK_SIGNING_SECRET:?Set PAYMENTS_WEBHOOK_SIGNING_SECRET in .env}
+  PAYMENTS_WEBHOOK_RETRY_SECOND_DELAY_SECONDS: ${PAYMENTS_WEBHOOK_RETRY_SECOND_DELAY_SECONDS:-1}
+  PAYMENTS_WEBHOOK_RETRY_THIRD_DELAY_SECONDS: ${PAYMENTS_WEBHOOK_RETRY_THIRD_DELAY_SECONDS:-2}
+
+x-app-base: &app-base
+  build: .
+  environment: *app-environment
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  migrate:
+    <<: *app-base
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app-base
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; request = urllib.request.Request('http://localhost:8000/health/live', headers={'X-API-Key': os.environ['PAYMENTS_API_KEY']}); urllib.request.urlopen(request, timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  outbox-publisher:
+    <<: *app-base
+    command: ["python", "-m", "app.messaging.publisher"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app-base
+    command: ["faststream", "run", "app.messaging.consumer:app"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+
